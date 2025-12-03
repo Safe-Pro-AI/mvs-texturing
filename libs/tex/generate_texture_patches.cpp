@@ -99,6 +99,7 @@ generate_candidate(int label, TextureView const & texture_view,
     std::vector<math::Vec2f> texcoords;
     texcoords.reserve(faces.size() * 3);
 
+    // Compute projected pixel coords and bounding box
     for (std::size_t i = 0; i < faces.size(); ++i) {
         for (std::size_t j = 0; j < 3; ++j) {
             math::Vec3f vertex = vertices[mesh_faces[faces[i] * 3 + j]];
@@ -106,64 +107,59 @@ generate_candidate(int label, TextureView const & texture_view,
 
             texcoords.push_back(pixel);
 
-            int px = static_cast<int>(std::floor(pixel[0]));
-            int py = static_cast<int>(std::floor(pixel[1]));
-            int px_max = static_cast<int>(std::ceil(pixel[0]));
-            int py_max = static_cast<int>(std::ceil(pixel[1]));
+            int px      = static_cast<int>(std::floor(pixel[0]));
+            int py      = static_cast<int>(std::floor(pixel[1]));
+            int px_max  = static_cast<int>(std::ceil (pixel[0]));
+            int py_max  = static_cast<int>(std::ceil (pixel[1]));
 
-            min_x = std::min(px,     min_x);
-            min_y = std::min(py,     min_y);
-            max_x = std::max(px_max, max_x);
-            max_y = std::max(py_max, max_y);
+            min_x = std::min(min_x, px);
+            min_y = std::min(min_y, py);
+            max_x = std::max(max_x, px_max);
+            max_y = std::max(max_y, py_max);
         }
     }
 
-    // Clamp to image bounds to avoid out-of-range crops due to rounding/FP drift.
+    // If nothing valid was found, fall back to a 1x1 patch at (0,0)
+    if (min_x > max_x || min_y > max_y) {
+        min_x = min_y = 0;
+        max_x = max_y = 0;
+    }
+
+    // Clamp to image bounds
     min_x = std::max(0, std::min(min_x, img_w - 1));
     min_y = std::max(0, std::min(min_y, img_h - 1));
     max_x = std::max(0, std::min(max_x, img_w - 1));
     max_y = std::max(0, std::min(max_y, img_h - 1));
 
-    // If the ranges got inverted for any reason, fix them.
+    // Expand by border, clamped again
+    min_x = std::max(0, min_x - texture_patch_border);
+    min_y = std::max(0, min_y - texture_patch_border);
+    max_x = std::min(img_w - 1, max_x + texture_patch_border);
+    max_y = std::min(img_h - 1, max_y + texture_patch_border);
+
+    // Final sanity in case something inverted
     if (max_x < min_x) std::swap(max_x, min_x);
     if (max_y < min_y) std::swap(max_y, min_y);
 
     int width  = max_x - min_x + 1;
     int height = max_y - min_y + 1;
 
-    // Ensure non-zero dimensions.
     if (width <= 0)  width = 1;
     if (height <= 0) height = 1;
 
-    // Add border, then clamp again to the image size.
-    min_x -= texture_patch_border;
-    min_y -= texture_patch_border;
-    max_x += texture_patch_border;
-    max_y += texture_patch_border;
-
-    min_x = std::max(0, std::min(min_x, img_w - 1));
-    min_y = std::max(0, std::min(min_y, img_h - 1));
-    max_x = std::max(0, std::min(max_x, img_w - 1));
-    max_y = std::max(0, std::min(max_y, img_h - 1));
-
-    width  = max_x - min_x + 1;
-    height = max_y - min_y + 1;
-
-    if (width <= 0)  width = 1;
-    if (height <= 0) height = 1;
-
-    /* Calculate the relative texcoords. */
-    math::Vec2f min(min_x, min_y);
+    // Rebase texcoords so (min_x, min_y) becomes (0,0)
+    math::Vec2f offset(static_cast<float>(min_x), static_cast<float>(min_y));
     for (std::size_t i = 0; i < texcoords.size(); ++i) {
-        texcoords[i] = texcoords[i] - min;
+        texcoords[i] = texcoords[i] - offset;
     }
 
+    // Crop image region
     mve::FloatImage::Ptr image;
     if (view_image->get_type() == mve::IMAGE_TYPE_FLOAT) {
         mve::FloatImage::Ptr float_image = texture_view.get_image<float>();
         image = mve::image::crop<float>(
             float_image, width, height, min_x, min_y,
-            *math::Vec3f(3.402823466E38, 0, 3.402823466E38));
+            *math::Vec3f(3.402823466E38f, 0.0f, 3.402823466E38f));
     } else if (view_image->get_type() == mve::IMAGE_TYPE_UINT16) {
         mve::RawImage::Ptr raw_image = texture_view.get_image<uint16_t>();
         raw_image = mve::image::crop<uint16_t>(
@@ -183,11 +179,15 @@ generate_candidate(int label, TextureView const & texture_view,
         mve::image::gamma_correct(image, 2.2f);
     }
 
+    Rect<int> rect(min_x, min_y, width, height);
+
     TexturePatchCandidate texture_patch_candidate =
-        { Rect<int>(min_x, min_y, max_x, max_y),
+        { rect,
           TexturePatch::create(label, faces, texcoords, image) };
+
     return texture_patch_candidate;
 }
+
 
 bool fill_hole(std::vector<std::size_t> const & hole, UniGraph const & graph,
     mve::TriangleMesh::ConstPtr mesh, mve::MeshInfo const & mesh_info,
