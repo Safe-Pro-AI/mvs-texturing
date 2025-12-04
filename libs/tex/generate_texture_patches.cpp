@@ -91,17 +91,6 @@ generate_candidate(int label, TextureView const & texture_view,
     int img_w = view_image->width();
     int img_h = view_image->height();
 
-    // Fallback for degenerate images
-    if (img_w <= 0 || img_h <= 0) {
-        mve::FloatImage::Ptr dummy = mve::FloatImage::create(1, 1, 3);
-        dummy->fill(0.0f);
-        std::vector<math::Vec2f> texcoords(3, math::Vec2f(0.0f, 0.0f));
-        return {
-            Rect<int>(0, 0, 1, 1),
-            TexturePatch::create(label, faces, texcoords, dummy)
-        };
-    }
-
     int min_x = img_w;
     int min_y = img_h;
     int max_x = 0;
@@ -113,26 +102,28 @@ generate_candidate(int label, TextureView const & texture_view,
     std::vector<math::Vec2f> texcoords;
     texcoords.reserve(faces.size() * 3);
 
-    // Debug tracking of original UV ranges.
+    // For debug: track *raw* UVs before clamping, just to see what’s going on.
     float raw_min_u =  std::numeric_limits<float>::infinity();
     float raw_min_v =  std::numeric_limits<float>::infinity();
     float raw_max_u = -std::numeric_limits<float>::infinity();
     float raw_max_v = -std::numeric_limits<float>::infinity();
-    bool any_finite_uv    = false;
-    bool any_clamped_uv   = false;
-    bool any_nonfinite_uv = false;
-
-    // Anything way outside the image is treated as invalid.
-    float safe_limit = static_cast<float>(std::max(img_w, img_h)) * 4.0f;
+    bool  any_finite_uv   = false;
+    bool  any_nonfinite_uv = false;
+    bool  any_clamped_uv  = false;
 
     auto clamp_to_image = [img_w, img_h](float &u, float &v, bool &clamped) {
         float u0 = u, v0 = v;
-        if (u < 0.0f) u = 0.0f;
-        if (v < 0.0f) v = 0.0f;
+
+        // Hard clamp to a *slightly* generous range, then to the image.
+        // This kills crazy huge finite numbers without relying on isfinite alone.
         float max_u = static_cast<float>(img_w - 1);
         float max_v = static_cast<float>(img_h - 1);
-        if (u > max_u) u = max_u;
-        if (v > max_v) v = max_v;
+
+        if (u < 0.0f)   u = 0.0f;
+        if (v < 0.0f)   v = 0.0f;
+        if (u > max_u)  u = max_u;
+        if (v > max_v)  v = max_v;
+
         if (u != u0 || v != v0)
             clamped = true;
     };
@@ -140,59 +131,50 @@ generate_candidate(int label, TextureView const & texture_view,
     for (std::size_t i = 0; i < faces.size(); ++i) {
         for (std::size_t j = 0; j < 3; ++j) {
             math::Vec3f vertex = vertices[mesh_faces[faces[i] * 3 + j]];
-            math::Vec2f pixel = texture_view.get_pixel_coords(vertex);
+            math::Vec2f pixel  = texture_view.get_pixel_coords(vertex);
 
             float u = pixel[0];
             float v = pixel[1];
 
-            bool valid =
-                std::isfinite(u) && std::isfinite(v) &&
-                std::fabs(u) <= safe_limit &&
-                std::fabs(v) <= safe_limit;
-
-            if (!valid) {
+            // Guard against NaNs / Infs.
+            if (!std::isfinite(u) || !std::isfinite(v)) {
                 any_nonfinite_uv = true;
-                // Fall back to image center for garbage / non-finite UVs.
+                // Fall back to image center.
                 u = (img_w - 1) * 0.5f;
                 v = (img_h - 1) * 0.5f;
             } else {
                 any_finite_uv = true;
-                // Track raw (unclamped) UV range for debugging only.
+
+                // Track *raw* UVs before clamping for logging.
                 raw_min_u = std::min(raw_min_u, u);
                 raw_min_v = std::min(raw_min_v, v);
                 raw_max_u = std::max(raw_max_u, u);
                 raw_max_v = std::max(raw_max_v, v);
             }
 
-            // Clamp *after* validation, before we use for bbox.
+            // Clamp everything into [0, w-1] × [0, h-1].
             clamp_to_image(u, v, any_clamped_uv);
 
             math::Vec2f uv(u, v);
             texcoords.push_back(uv);
 
-            int px0 = static_cast<int>(std::floor(u));
-            int py0 = static_cast<int>(std::floor(v));
-            int px1 = static_cast<int>(std::ceil(u));
-            int py1 = static_cast<int>(std::ceil(v));
+            int px     = static_cast<int>(std::floor(u));
+            int py     = static_cast<int>(std::floor(v));
+            int px_max = static_cast<int>(std::ceil(u));
+            int py_max = static_cast<int>(std::ceil(v));
 
-            min_x = std::min(min_x, px0);
-            min_y = std::min(min_y, py0);
-            max_x = std::max(max_x, px1);
-            max_y = std::max(max_y, py1);
+            min_x = std::min(min_x, px);
+            min_y = std::min(min_y, py);
+            max_x = std::max(max_x, px_max);
+            max_y = std::max(max_y, py_max);
         }
     }
 
-    // If nothing finite was seen (all garbage), create a tiny patch at image center.
-    if (!any_finite_uv || faces.empty()) {
+    // If literally nothing finite was seen, create a 1×1 patch at center.
+    if (!any_finite_uv) {
         any_nonfinite_uv = true;
-        int cx = img_w / 2;
-        int cy = img_h / 2;
-        min_x = cx;
-        min_y = cy;
-        max_x = cx;
-        max_y = cy;
-        texcoords.assign(3, math::Vec2f(static_cast<float>(cx),
-                                        static_cast<float>(cy)));
+        min_x = max_x = img_w / 2;
+        min_y = max_y = img_h / 2;
     }
 
     // Clamp bbox to image bounds.
@@ -204,13 +186,14 @@ generate_candidate(int label, TextureView const & texture_view,
     if (max_x < min_x) std::swap(max_x, min_x);
     if (max_y < min_y) std::swap(max_y, min_y);
 
+    // Compute width/height from bbox.
     int width  = max_x - min_x + 1;
     int height = max_y - min_y + 1;
 
-    if (width <= 0)  width = 1;
+    if (width <= 0)  width  = 1;
     if (height <= 0) height = 1;
 
-    // Add border, then clamp again to image size.
+    // Grow by border, then clamp again.
     min_x -= texture_patch_border;
     min_y -= texture_patch_border;
     max_x += texture_patch_border;
@@ -224,24 +207,23 @@ generate_candidate(int label, TextureView const & texture_view,
     if (max_x < min_x) std::swap(max_x, min_x);
     if (max_y < min_y) std::swap(max_y, min_y);
 
-    // Final inclusive bbox.
     width  = max_x - min_x + 1;
     height = max_y - min_y + 1;
 
-    if (width <= 0)  width = 1;
+    if (width <= 0)  width  = 1;
     if (height <= 0) height = 1;
 
-    // Rebase texcoords so that (min_x,min_y) becomes (0,0) within the patch.
+    // Rebase texcoords so top-left of patch is (0,0).
     math::Vec2f origin(static_cast<float>(min_x), static_cast<float>(min_y));
     for (std::size_t i = 0; i < texcoords.size(); ++i) {
         texcoords[i] -= origin;
     }
 
-    // Debug logging (bbox is printed as inclusive for human readability).
+    // Debug logging.
     std::cout << "[texrecon] candidate label=" << label
               << " faces=" << faces.size()
               << " bbox=(" << min_x << "," << min_y << ")-("
-              << (min_x + width  - 1) << "," << (min_y + height - 1) << ")"
+              << max_x << "," << max_y << ")"
               << " size=" << width << "x" << height;
 
     if (any_finite_uv) {
@@ -259,33 +241,36 @@ generate_candidate(int label, TextureView const & texture_view,
 
     std::cout << std::endl;
 
-    // Build the patch image.
+    // Build the patch image (always as float).
     mve::FloatImage::Ptr image;
 
     if (view_image->get_type() == mve::IMAGE_TYPE_FLOAT) {
         mve::FloatImage::Ptr float_image = texture_view.get_image<float>();
-        const float fill_color[3] = {0.0f, 0.0f, 0.0f};
-        image = mve::image::crop(float_image, width, height,
-                                 min_x, min_y, fill_color);
+        const float fill_color[3] = {
+            std::numeric_limits<float>::max(),
+            0.0f,
+            std::numeric_limits<float>::max()
+        };
+        image = mve::image::crop(float_image, width, height, min_x, min_y, fill_color);
     } else if (view_image->get_type() == mve::IMAGE_TYPE_UINT16) {
         mve::RawImage::Ptr raw_image = texture_view.get_image<uint16_t>();
         const uint16_t fill_color[3] = {
+            std::numeric_limits<uint16_t>::max(),
             static_cast<uint16_t>(0),
-            static_cast<uint16_t>(0),
-            static_cast<uint16_t>(0)
+            std::numeric_limits<uint16_t>::max()
         };
-        mve::RawImage::Ptr cropped = mve::image::crop(
-            raw_image, width, height, min_x, min_y, fill_color);
+        mve::RawImage::Ptr cropped =
+            mve::image::crop(raw_image, width, height, min_x, min_y, fill_color);
         image = mve::image::raw_to_float_image(cropped);
     } else {
         mve::ByteImage::Ptr byte_image = texture_view.get_image<uint8_t>();
         const uint8_t fill_color[3] = {
+            std::numeric_limits<uint8_t>::max(),
             static_cast<uint8_t>(0),
-            static_cast<uint8_t>(0),
-            static_cast<uint8_t>(0)
+            std::numeric_limits<uint8_t>::max()
         };
-        mve::ByteImage::Ptr cropped = mve::image::crop(
-            byte_image, width, height, min_x, min_y, fill_color);
+        mve::ByteImage::Ptr cropped =
+            mve::image::crop(byte_image, width, height, min_x, min_y, fill_color);
         image = mve::image::byte_to_float_image(cropped);
     }
 
@@ -293,17 +278,15 @@ generate_candidate(int label, TextureView const & texture_view,
         mve::image::gamma_correct(image, 2.2f);
     }
 
-    // IMPORTANT: Rect uses (min_x, min_y, max_x, max_y) with max exclusive.
-    Rect<int> rect(min_x,
-                   min_y,
-                   min_x + width,
-                   min_y + height);
+    // IMPORTANT: Rect<int>(x, y, width, height), NOT (min_x, min_y, max_x, max_y).
+    Rect<int> rect(min_x, min_y, width, height);
 
     TexturePatchCandidate texture_patch_candidate =
         { rect, TexturePatch::create(label, faces, texcoords, image) };
 
     return texture_patch_candidate;
 }
+
 
 
 bool fill_hole(std::vector<std::size_t> const & hole, UniGraph const & graph,
