@@ -88,107 +88,74 @@ generate_candidate(int label, TextureView const & texture_view,
     Settings const & settings)
 {
     mve::ImageBase::Ptr view_image = texture_view.get_image();
-    int const img_w = view_image->width();
-    int const img_h = view_image->height();
+    int img_w = view_image->width();
+    int img_h = view_image->height();
+
+    int min_x = img_w;
+    int min_y = img_h;
+    int max_x = 0;
+    int max_y = 0;
 
     mve::TriangleMesh::FaceList const & mesh_faces = mesh->get_faces();
     mve::TriangleMesh::VertexList const & vertices = mesh->get_vertices();
 
-    int min_x = img_w, min_y = img_h;
-    int max_x = -1,  max_y = -1;
-
     std::vector<math::Vec2f> texcoords;
     texcoords.reserve(faces.size() * 3);
 
-    // Debug state
-    std::size_t skipped_faces = 0;
-    bool saw_nonfinite = false;
-    bool saw_bbox_clamp = false;
-
-    float raw_min_u =  std::numeric_limits<float>::infinity();
-    float raw_min_v =  std::numeric_limits<float>::infinity();
+    // Debug tracking of original UV ranges.
+    float raw_min_u = std::numeric_limits<float>::infinity();
+    float raw_min_v = std::numeric_limits<float>::infinity();
     float raw_max_u = -std::numeric_limits<float>::infinity();
     float raw_max_v = -std::numeric_limits<float>::infinity();
+    bool any_finite_uv   = false;
+    bool any_clamped_uv  = false;
+    bool any_nonfinite_uv = false;
 
-    // Helper: clamp UVs into image bounds
-    auto clamp_uv = [&](float u, float v, float &cu, float &cv) -> bool {
-        if (!std::isfinite(u) || !std::isfinite(v)) {
-            saw_nonfinite = true;
-            return false;
-        }
-
-        // Reject ridiculously large UVs – projection clearly invalid
-        if (fabs(u) > 1e6f || fabs(v) > 1e6f) return false;
-
-        cu = u;
-        cv = v;
-
-        if (cu < -0.5f || cu > img_w - 0.5f ||
-            cv < -0.5f || cv > img_h - 0.5f)
-        {
-            // Outside image or behind camera — reject whole face
-            return false;
-        }
-
-        // Light clamp so we stay within rounding tolerance
-        if (cu < 0.0f) { cu = 0.0f; saw_bbox_clamp = true; }
-        else if (cu > img_w - 1) { cu = img_w - 1; saw_bbox_clamp = true; }
-
-        if (cv < 0.0f) { cv = 0.0f; saw_bbox_clamp = true; }
-        else if (cv > img_h - 1) { cv = img_h - 1; saw_bbox_clamp = true; }
-
-        return true;
+    auto clamp_to_image = [img_w, img_h](float &u, float &v, bool &clamped) {
+        float u0 = u, v0 = v;
+        if (u < 0.0f) u = 0.0f;
+        if (v < 0.0f) v = 0.0f;
+        float max_u = static_cast<float>(img_w - 1);
+        float max_v = static_cast<float>(img_h - 1);
+        if (u > max_u) u = max_u;
+        if (v > max_v) v = max_v;
+        if (u != u0 || v != v0)
+            clamped = true;
     };
 
-    // ====== First pass: project faces safely ======
-    for (std::size_t fi = 0; fi < faces.size(); ++fi) {
-        std::size_t face_id = faces[fi];
-        if (face_id * 3 + 2 >= mesh_faces.size()) {
-            skipped_faces++;
-            continue;
-        }
+    for (std::size_t i = 0; i < faces.size(); ++i) {
+        for (std::size_t j = 0; j < 3; ++j) {
+            math::Vec3f vertex = vertices[mesh_faces[faces[i] * 3 + j]];
+            math::Vec2f pixel = texture_view.get_pixel_coords(vertex);
 
-        math::Vec2f projected[3];
-        bool ok = true;
+            float u = pixel[0];
+            float v = pixel[1];
 
-        for (int j = 0; j < 3; ++j) {
-            math::Vec3f const &vertex =
-                vertices[mesh_faces[face_id * 3 + j]];
+            if (!std::isfinite(u) || !std::isfinite(v)) {
+                any_nonfinite_uv = true;
+                // Fall back to image center for non-finite UVs
+                u = (img_w - 1) * 0.5f;
+                v = (img_h - 1) * 0.5f;
+            } else {
+                any_finite_uv = true;
 
-            math::Vec2f uv = texture_view.get_pixel_coords(vertex);
-
-            float u = uv[0];
-            float v = uv[1];
-            float cu, cv;
-
-            // Track raw for debugging
-            if (std::isfinite(u) && std::isfinite(v)) {
+                // Track raw (unclamped) UV range for debugging
                 raw_min_u = std::min(raw_min_u, u);
                 raw_min_v = std::min(raw_min_v, v);
                 raw_max_u = std::max(raw_max_u, u);
                 raw_max_v = std::max(raw_max_v, v);
+
+                // Clamp UVs to image bounds
+                clamp_to_image(u, v, any_clamped_uv);
             }
 
-            if (!clamp_uv(u, v, cu, cv)) {
-                ok = false; break;
-            }
+            math::Vec2f uv(u, v);
+            texcoords.push_back(uv);
 
-            projected[j] = math::Vec2f(cu, cv);
-        }
-
-        if (!ok) {
-            skipped_faces++;
-            continue;
-        }
-
-        // Use these projected coords
-        for (int j = 0; j < 3; ++j) {
-            texcoords.push_back(projected[j]);
-
-            int px     = static_cast<int>(std::floor(projected[j][0]));
-            int py     = static_cast<int>(std::floor(projected[j][1]));
-            int px_max = static_cast<int>(std::ceil (projected[j][0]));
-            int py_max = static_cast<int>(std::ceil (projected[j][1]));
+            int px     = static_cast<int>(std::floor(u));
+            int py     = static_cast<int>(std::floor(v));
+            int px_max = static_cast<int>(std::ceil(u));
+            int py_max = static_cast<int>(std::ceil(v));
 
             min_x = std::min(min_x, px);
             min_y = std::min(min_y, py);
@@ -197,13 +164,14 @@ generate_candidate(int label, TextureView const & texture_view,
         }
     }
 
-    // If all faces were bad, make a 1×1 dummy patch
-    if (texcoords.empty() || min_x > max_x || min_y > max_y) {
-        min_x = min_y = 0;
-        max_x = max_y = 0;
+    // If nothing finite was seen, create a tiny 1x1 patch at image center.
+    if (!any_finite_uv) {
+        any_nonfinite_uv = true;
+        min_x = max_x = img_w / 2;
+        min_y = max_y = img_h / 2;
     }
 
-    // Clamp bbox
+    // Clamp initial bbox to image bounds.
     min_x = std::max(0, std::min(min_x, img_w - 1));
     min_y = std::max(0, std::min(min_y, img_h - 1));
     max_x = std::max(0, std::min(max_x, img_w - 1));
@@ -218,7 +186,7 @@ generate_candidate(int label, TextureView const & texture_view,
     if (width <= 0)  width = 1;
     if (height <= 0) height = 1;
 
-    // Border + clamp again
+    // Add border, then clamp again to image size.
     min_x -= texture_patch_border;
     min_y -= texture_patch_border;
     max_x += texture_patch_border;
@@ -229,89 +197,86 @@ generate_candidate(int label, TextureView const & texture_view,
     max_x = std::max(0, std::min(max_x, img_w - 1));
     max_y = std::max(0, std::min(max_y, img_h - 1));
 
+    if (max_x < min_x) std::swap(max_x, min_x);
+    if (max_y < min_y) std::swap(max_y, min_y);
+
     width  = max_x - min_x + 1;
     height = max_y - min_y + 1;
 
     if (width <= 0)  width = 1;
     if (height <= 0) height = 1;
 
-    // ===== Clamp texcoords to patch-local safe region =====
-    math::Vec2f offset(float(min_x), float(min_y));
-    float const max_u = float(width  - 1);
-    float const max_v = float(height - 1);
-
-    bool texcoord_clamped = false;
-
-    for (auto &uv : texcoords) {
-        if (!std::isfinite(uv[0]) || !std::isfinite(uv[1])) {
-            uv[0] = 0.5f * max_u;
-            uv[1] = 0.5f * max_v;
-            texcoord_clamped = true;
-            continue;
-        }
-
-        uv -= offset;
-
-        if (uv[0] < 0.0f)        { uv[0] = 0.0f; texcoord_clamped = true; }
-        else if (uv[0] > max_u)  { uv[0] = max_u; texcoord_clamped = true; }
-
-        if (uv[1] < 0.0f)        { uv[1] = 0.0f; texcoord_clamped = true; }
-        else if (uv[1] > max_v)  { uv[1] = max_v; texcoord_clamped = true; }
+    // Rebase texcoords so that (min_x,min_y) becomes (0,0) within the patch.
+    math::Vec2f origin{static_cast<float>(min_x), static_cast<float>(min_y)};
+    for (std::size_t i = 0; i < texcoords.size(); ++i) {
+        texcoords[i] -= origin;
     }
 
-    // ====== DEBUG OUTPUT (concise + useful) ======
-    if (saw_nonfinite || saw_bbox_clamp || texcoord_clamped || skipped_faces > 0) {
-        std::cerr
-          << "[texrecon] label=" << label
-          << " faces=" << faces.size()
-          << " used=" << (texcoords.size() / 3)
-          << " skipped=" << skipped_faces
-          << " bbox=(" << min_x << "," << min_y << ")-("
-                        << max_x << "," << max_y << ") "
-          << width << "x" << height
-          << " raw_uv=(" << raw_min_u << "," << raw_min_v << ")-("
-                          << raw_max_u << "," << raw_max_v << ")";
+    // Debug logging (similar to the previous output you showed).
+    std::cout << "[texrecon] candidate label=" << label
+              << " faces=" << faces.size()
+              << " bbox=(" << min_x << "," << min_y << ")-("
+              << max_x << "," << max_y << ")"
+              << " size=" << width << "x" << height;
 
-        if (saw_nonfinite)    std::cerr << " [NONFINITE UV]";
-        if (saw_bbox_clamp)   std::cerr << " [BBOX CLAMPED]";
-        if (texcoord_clamped) std::cerr << " [TEXCOORD CLAMPED]";
-        if (width > img_w/2 || height > img_h/2)
-            std::cerr << " [LARGE PATCH]";
-
-        std::cerr << "\n";
+    if (any_finite_uv) {
+        std::cout << " raw_uv=(" << raw_min_u << "," << raw_min_v
+                  << ")-(" << raw_max_u << "," << raw_max_v << ")";
+    } else {
+        std::cout << " raw_uv=(nan,nan)-(nan,nan)";
     }
 
-    // ===== Crop patch image =====
+    if (any_nonfinite_uv) {
+        std::cout << " [nonfinite UVs]";
+    } else if (any_clamped_uv) {
+        std::cout << " [texcoord CLAMPED]";
+    }
+
+    std::cout << std::endl;
+
+    // Build the patch image.
     mve::FloatImage::Ptr image;
 
     if (view_image->get_type() == mve::IMAGE_TYPE_FLOAT) {
-        float fill[3] = {3.402823466e38f, 0.0f, 3.402823466e38f};
-        image = mve::image::crop<float>(
-            texture_view.get_image<float>(), width, height, min_x, min_y, fill);
-
+        mve::FloatImage::Ptr float_image = texture_view.get_image<float>();
+        const float fill_color[3] = {
+            std::numeric_limits<float>::max(),
+            0.0f,
+            std::numeric_limits<float>::max()
+        };
+        image = mve::image::crop(
+            float_image, width, height, min_x, min_y, fill_color);
     } else if (view_image->get_type() == mve::IMAGE_TYPE_UINT16) {
-        uint16_t fill[3] = {65535u, 0u, 65535u};
-        mve::RawImage::Ptr raw =
-            mve::image::crop<uint16_t>(
-                texture_view.get_image<uint16_t>(), width, height, min_x, min_y, fill);
-        image = mve::image::raw_to_float_image(raw);
-
+        mve::RawImage::Ptr raw_image = texture_view.get_image<uint16_t>();
+        const uint16_t fill_color[3] = {
+            std::numeric_limits<uint16_t>::max(),
+            static_cast<uint16_t>(0),
+            std::numeric_limits<uint16_t>::max()
+        };
+        mve::RawImage::Ptr cropped = mve::image::crop(
+            raw_image, width, height, min_x, min_y, fill_color);
+        image = mve::image::raw_to_float_image(cropped);
     } else {
-        uint8_t fill[3] = {255u, 0u, 255u};
-        mve::ByteImage::Ptr byte =
-            mve::image::crop<uint8_t>(
-                texture_view.get_image<uint8_t>(), width, height, min_x, min_y, fill);
-        image = mve::image::byte_to_float_image(byte);
+        mve::ByteImage::Ptr byte_image = texture_view.get_image<uint8_t>();
+        const uint8_t fill_color[3] = {
+            std::numeric_limits<uint8_t>::max(),
+            static_cast<uint8_t>(0),
+            std::numeric_limits<uint8_t>::max()
+        };
+        mve::ByteImage::Ptr cropped = mve::image::crop(
+            byte_image, width, height, min_x, min_y, fill_color);
+        image = mve::image::byte_to_float_image(cropped);
     }
 
-    if (settings.tone_mapping == TONE_MAPPING_GAMMA)
+    if (settings.tone_mapping == TONE_MAPPING_GAMMA) {
         mve::image::gamma_correct(image, 2.2f);
+    }
 
-    // Rect<int> = (min_x, min_y, max_x, max_y) in this codebase
-    return {
-        Rect<int>(min_x, min_y, max_x, max_y),
-        TexturePatch::create(label, faces, texcoords, image)
-    };
+    TexturePatchCandidate texture_patch_candidate =
+        { Rect<int>(min_x, min_y, max_x, max_y),
+          TexturePatch::create(label, faces, texcoords, image) };
+
+    return texture_patch_candidate;
 }
 
 
