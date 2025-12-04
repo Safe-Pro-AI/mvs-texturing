@@ -107,8 +107,8 @@ generate_candidate(int label, TextureView const & texture_view,
     float raw_min_v = std::numeric_limits<float>::infinity();
     float raw_max_u = -std::numeric_limits<float>::infinity();
     float raw_max_v = -std::numeric_limits<float>::infinity();
-    bool any_finite_uv   = false;
-    bool any_clamped_uv  = false;
+    bool any_finite_uv    = false;
+    bool any_clamped_uv   = false;
     bool any_nonfinite_uv = false;
 
     auto clamp_to_image = [img_w, img_h](float &u, float &v, bool &clamped) {
@@ -212,7 +212,7 @@ generate_candidate(int label, TextureView const & texture_view,
         texcoords[i] -= origin;
     }
 
-    // Debug logging (similar to the previous output you showed).
+    // Debug logging.
     std::cout << "[texrecon] candidate label=" << label
               << " faces=" << faces.size()
               << " bbox=(" << min_x << "," << min_y << ")-("
@@ -273,7 +273,7 @@ generate_candidate(int label, TextureView const & texture_view,
     }
 
     TexturePatchCandidate texture_patch_candidate =
-        { Rect<int>(min_x, min_y, max_x, max_y),
+        { Rect<int>(min_x, min_y, width, height),
           TexturePatch::create(label, faces, texcoords, image) };
 
     return texture_patch_candidate;
