@@ -85,14 +85,8 @@ generate_candidate(int label, TextureView const & texture_view,
     Settings const & settings)
 {
     mve::ImageBase::Ptr view_image = texture_view.get_image();
-    const int image_width  = view_image->width();
-    const int image_height = view_image->height();
-
-    // Start bbox at full image, then shrink.
-    int min_x = image_width;
-    int min_y = image_height;
-    int max_x = -1;
-    int max_y = -1;
+    int min_x = view_image->width(), min_y = view_image->height();
+    int max_x = 0, max_y = 0;
 
     mve::TriangleMesh::FaceList const & mesh_faces = mesh->get_faces();
     mve::TriangleMesh::VertexList const & vertices = mesh->get_vertices();
@@ -103,53 +97,25 @@ generate_candidate(int label, TextureView const & texture_view,
     for (std::size_t i = 0; i < faces.size(); ++i) {
         for (std::size_t j = 0; j < 3; ++j) {
             math::Vec3f vertex = vertices[mesh_faces[faces[i] * 3 + j]];
-            math::Vec2f pixel  = texture_view.get_pixel_coords(vertex);
+            math::Vec2f pixel = texture_view.get_pixel_coords(vertex);
 
-            // If projections go NaN or wildly outside, clamp them into the image.
-            if (!std::isfinite(pixel[0]) || !std::isfinite(pixel[1])) {
-                continue; // skip totally broken projections
-            }
+            texcoords.push_back(pixel);
 
-            float px = pixel[0];
-            float py = pixel[1];
-
-            // Clamp to image bounds; this prevents negative / >width coords
-            // from producing insane widths and corrupting the heap later.
-            px = std::max(0.0f, std::min(px, static_cast<float>(image_width  - 1)));
-            py = std::max(0.0f, std::min(py, static_cast<float>(image_height - 1)));
-
-            math::Vec2f clamped(px, py);
-            texcoords.push_back(clamped);
-
-            int fx = static_cast<int>(std::floor(px));
-            int fy = static_cast<int>(std::floor(py));
-            int cx = static_cast<int>(std::ceil(px));
-            int cy = static_cast<int>(std::ceil(py));
-
-            if (fx < min_x) min_x = fx;
-            if (fy < min_y) min_y = fy;
-            if (cx > max_x) max_x = cx;
-            if (cy > max_y) max_y = cy;
+            min_x = std::min(static_cast<int>(std::floor(pixel[0])), min_x);
+            min_y = std::min(static_cast<int>(std::floor(pixel[1])), min_y);
+            max_x = std::max(static_cast<int>(std::ceil(pixel[0])), max_x);
+            max_y = std::max(static_cast<int>(std::ceil(pixel[1])), max_y);
         }
     }
 
-    // No valid projections? Bail out in a controlled way.
-    if (texcoords.empty() || min_x > max_x || min_y > max_y) {
-        throw std::runtime_error("generate_candidate: no valid projections for this patch");
-    }
-
-    // Make absolutely sure bbox is inside the image before computing width/height.
-    min_x = std::max(0, min_x);
-    min_y = std::max(0, min_y);
-    max_x = std::min(max_x, image_width  - 1);
-    max_y = std::min(max_y, image_height - 1);
+    /* Check for valid projections/erroneous labeling files. */
+    assert(min_x >= 0);
+    assert(min_y >= 0);
+    assert(max_x < view_image->width());
+    assert(max_y < view_image->height());
 
     int width  = max_x - min_x + 1;
     int height = max_y - min_y + 1;
-
-    if (width <= 0 || height <= 0) {
-        throw std::runtime_error("generate_candidate: non-positive width/height after clamping");
-    }
 
     /* Add border and adjust min accordingly. */
     width  += 2 * texture_patch_border;
@@ -158,32 +124,41 @@ generate_candidate(int label, TextureView const & texture_view,
     min_y  -= texture_patch_border;
 
     /* Calculate the relative texcoords. */
-    math::Vec2f min_vec(static_cast<float>(min_x), static_cast<float>(min_y));
+    math::Vec2f min(min_x, min_y);
     for (std::size_t i = 0; i < texcoords.size(); ++i) {
-        texcoords[i] = texcoords[i] - min_vec;
+        texcoords[i] = texcoords[i] - min;
     }
 
     mve::FloatImage::Ptr image;
 
     if (view_image->get_type() == mve::IMAGE_TYPE_FLOAT) {
         mve::FloatImage::Ptr float_image = texture_view.get_image<float>();
+
+        // Fill color for float image: big value, 0, big value
         math::Vec3f fill_color(3.402823466e38f, 0.0f, 3.402823466e38f);
         image = mve::image::crop<float>(
-            float_image, width, height, min_x, min_y, fill_color);
-    }
-    else if (view_image->get_type() == mve::IMAGE_TYPE_UINT16) {
+            float_image, width, height, min_x, min_y,
+            fill_color.begin()  // const float*
+        );
+
+    } else if (view_image->get_type() == mve::IMAGE_TYPE_UINT16) {
         mve::RawImage::Ptr raw_image = texture_view.get_image<uint16_t>();
+
         math::Vec3us fill_color(65535, 0, 65535);
         raw_image = mve::image::crop<uint16_t>(
-            raw_image, width, height, min_x, min_y, fill_color);
+            raw_image, width, height, min_x, min_y,
+            fill_color.begin()  // const uint16_t*
+        );
         image = mve::image::raw_to_float_image(raw_image);
-    }
-    else {
-        mve::ByteImage::Ptr byte_image =
-            texture_view.get_image<uint8_t>();
+
+    } else {
+        mve::ByteImage::Ptr byte_image = texture_view.get_image<uint8_t>();
+
         math::Vec3uc fill_color(255, 0, 255);
         byte_image = mve::image::crop<uint8_t>(
-            byte_image, width, height, min_x, min_y, fill_color);
+            byte_image, width, height, min_x, min_y,
+            fill_color.begin()  // const uint8_t*
+        );
         image = mve::image::byte_to_float_image(byte_image);
     }
 
@@ -194,9 +169,9 @@ generate_candidate(int label, TextureView const & texture_view,
     TexturePatchCandidate texture_patch_candidate =
         {Rect<int>(min_x, min_y, max_x, max_y),
          TexturePatch::create(label, faces, texcoords, image)};
-
     return texture_patch_candidate;
 }
+
 
 
 bool fill_hole(std::vector<std::size_t> const & hole, UniGraph const & graph,
