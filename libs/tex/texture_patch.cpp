@@ -178,10 +178,59 @@ TexturePatch::set_pixel_value(math::Vec2i pixel, math::Vec3f color) {
 }
 
 void
-TexturePatch::blend(mve::FloatImage::ConstPtr orig) {
-    poisson_blend(orig, blending_mask, image, 1.0f);
+TexturePatch::blend(mve::FloatImage::ConstPtr orig)
+{
+    // Basic sanity: all required images must exist.
+    if (!orig || !blending_mask || !image || !validity_mask)
+        return;
 
-    /* Invalidate all pixels outside the boundary. */
+    int w  = image->width();
+    int h  = image->height();
+    int ch = image->channels();
+
+    // Sanity checks for dimensions.
+    if (w <= 0 || h <= 0 ||
+        blending_mask->width()  != w ||
+        blending_mask->height() != h ||
+        validity_mask->width()  != w ||
+        validity_mask->height() != h) {
+        // Something is inconsistent; safest is to bail.
+        return;
+    }
+
+    // orig is supposed to correspond to this patch image. If it does not,
+    // we will *not* run Poisson blending, and instead do a simple alpha blend.
+    bool orig_matches =
+        (orig->width()  == w) &&
+        (orig->height() == h) &&
+        (orig->channels() == ch);
+
+    if (orig_matches) {
+        // Normal path: sizes look sane -> run Poisson blending.
+        poisson_blend(orig, blending_mask, image, 1.0f);
+    } else {
+        // Fallback path: simple masked blend to avoid heap corruption.
+        int tw = std::min(w, orig->width());
+        int th = std::min(h, orig->height());
+        int tch = std::min(ch, orig->channels());
+
+        for (int y = 0; y < th; ++y) {
+            for (int x = 0; x < tw; ++x) {
+                unsigned char mask_val = blending_mask->at(x, y, 0);
+                if (mask_val == 0)
+                    continue;
+
+                float a = static_cast<float>(mask_val) / 255.0f;
+                for (int c = 0; c < tch; ++c) {
+                    float src = orig->at(x, y, c);
+                    float dst = image->at(x, y, c);
+                    image->at(x, y, c) = a * src + (1.0f - a) * dst;
+                }
+            }
+        }
+    }
+
+    // Invalidate all pixels outside the boundary (unchanged logic).
     for (int y = 0; y < blending_mask->height(); ++y) {
         for (int x = 0; x < blending_mask->width(); ++x) {
             if (blending_mask->at(x, y, 0) == 64) {
@@ -190,6 +239,7 @@ TexturePatch::blend(mve::FloatImage::ConstPtr orig) {
         }
     }
 }
+
 
 typedef std::vector<std::pair<int, int> > PixelVector;
 typedef std::set<std::pair<int, int> > PixelSet;
