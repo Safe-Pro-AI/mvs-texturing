@@ -85,153 +85,120 @@ generate_candidate(int label, TextureView const & texture_view,
     Settings const & settings)
 {
     mve::ImageBase::Ptr view_image = texture_view.get_image();
-    const int img_w = view_image->width();
-    const int img_h = view_image->height();
+    const int image_width  = view_image->width();
+    const int image_height = view_image->height();
 
-    // Empty bbox to start
-    int min_x = img_w;
-    int min_y = img_h;
+    // Original-style bbox initialization
+    int min_x = std::numeric_limits<int>::max();
+    int min_y = std::numeric_limits<int>::max();
     int max_x = 0;
     int max_y = 0;
 
-    mve::TriangleMesh::FaceList const & mesh_faces = mesh->get_faces();
-    mve::TriangleMesh::VertexList const & vertices = mesh->get_vertices();
+    mve::TriangleMesh::FaceList  const & mesh_faces = mesh->get_faces();
+    mve::TriangleMesh::VertexList const & vertices  = mesh->get_vertices();
 
     std::vector<math::Vec2f> texcoords;
     texcoords.reserve(faces.size() * 3);
 
-    auto sanitize_uv = [img_w, img_h](float &u, float &v) {
-        // Treat non-finite or utterly insane values as invalid
-        if (!std::isfinite(u) || !std::isfinite(v) ||
-            u < -1e6f || v < -1e6f ||
-            u > img_w + 1e6f || v > img_h + 1e6f)
-        {
-            u = (img_w - 1) * 0.5f;
-            v = (img_h - 1) * 0.5f;
-        }
-
-        // Clamp to image bounds
-        if (u < 0.0f) u = 0.0f;
-        if (v < 0.0f) v = 0.0f;
-        float max_u = static_cast<float>(img_w - 1);
-        float max_v = static_cast<float>(img_h - 1);
-        if (u > max_u) u = max_u;
-        if (v > max_v) v = max_v;
-    };
-
-    // --- Gather texcoords and global bbox in source image space ---
     for (std::size_t i = 0; i < faces.size(); ++i) {
         for (std::size_t j = 0; j < 3; ++j) {
             math::Vec3f vertex = vertices[mesh_faces[faces[i] * 3 + j]];
             math::Vec2f pixel  = texture_view.get_pixel_coords(vertex);
 
-            float u = pixel[0];
-            float v = pixel[1];
-            sanitize_uv(u, v);
+            // --- Guard 1: non-finite projections ---
+            if (!std::isfinite(pixel[0]) || !std::isfinite(pixel[1])) {
+                // Fallback: put degenerate projections in the image center
+                pixel[0] = (image_width  > 0) ? (image_width  - 1) * 0.5f : 0.0f;
+                pixel[1] = (image_height > 0) ? (image_height - 1) * 0.5f : 0.0f;
+            }
 
-            math::Vec2f uv(u, v);
-            texcoords.push_back(uv);
+            // --- Guard 2: clamp to valid image range BEFORE bbox/int conversion ---
+            pixel[0] = std::max(0.0f,
+                                std::min(pixel[0],
+                                         static_cast<float>(image_width  - 1)));
+            pixel[1] = std::max(0.0f,
+                                std::min(pixel[1],
+                                         static_cast<float>(image_height - 1)));
 
-            int fx = static_cast<int>(std::floor(u));
-            int fy = static_cast<int>(std::floor(v));
-            int cx = static_cast<int>(std::ceil(u));
-            int cy = static_cast<int>(std::ceil(v));
+            texcoords.push_back(pixel);
 
-            if (fx < min_x) min_x = fx;
-            if (fy < min_y) min_y = fy;
-            if (cx > max_x) max_x = cx;
-            if (cy > max_y) max_y = cy;
+            int px     = static_cast<int>(std::floor(pixel[0]));
+            int py     = static_cast<int>(std::floor(pixel[1]));
+            int px_max = static_cast<int>(std::ceil(pixel[0]));
+            int py_max = static_cast<int>(std::ceil(pixel[1]));
+
+            if (px     < min_x) min_x = px;
+            if (py     < min_y) min_y = py;
+            if (px_max > max_x) max_x = px_max;
+            if (py_max > max_y) max_y = py_max;
         }
     }
 
-    // If everything went sideways, make a 1x1 patch at the image center
-    if (texcoords.empty() || min_x > max_x || min_y > max_y) {
-        int cx = img_w  > 0 ? (img_w  - 1) / 2 : 0;
-        int cy = img_h > 0 ? (img_h - 1) / 2 : 0;
-
-        min_x = max_x = cx;
-        min_y = max_y = cy;
-
-        texcoords.clear();
-        texcoords.reserve(faces.size() * 3);
-        for (std::size_t i = 0; i < faces.size() * 3; ++i) {
-            texcoords.emplace_back(static_cast<float>(cx),
-                                   static_cast<float>(cy));
-        }
+    // If for some reason bbox never got updated (should be rare), make a tiny patch.
+    if (min_x == std::numeric_limits<int>::max() ||
+        min_y == std::numeric_limits<int>::max()) {
+        min_x = min_y = 0;
+        max_x = max_y = 0;
     }
-
-    // Grow bbox by border in source-image space
-    min_x -= texture_patch_border;
-    min_y -= texture_patch_border;
-    max_x += texture_patch_border;
-    max_y += texture_patch_border;
-
-    // Clamp bbox to the image bounds
-    min_x = std::max(0, std::min(min_x, img_w  - 1));
-    min_y = std::max(0, std::min(min_y, img_h - 1));
-    max_x = std::max(0, std::min(max_x, img_w  - 1));
-    max_y = std::max(0, std::min(max_y, img_h - 1));
-
-    if (min_x > max_x) std::swap(min_x, max_x);
-    if (min_y > max_y) std::swap(min_y, max_y);
 
     int width  = max_x - min_x + 1;
     int height = max_y - min_y + 1;
 
-    if (width  <= 0) width  = 1;
+    // Extra safety: force at least 1x1
+    if (width <= 0)  width = 1;
     if (height <= 0) height = 1;
 
-    // --- Rebase texcoords into patch-local coordinates (0..width, 0..height) ---
-    math::Vec2f origin(static_cast<float>(min_x), static_cast<float>(min_y));
+    // --- Border logic: keep identical to original texrecon behavior ---
+    width  += 2 * texture_patch_border;
+    height += 2 * texture_patch_border;
+    min_x  -= texture_patch_border;
+    min_y  -= texture_patch_border;
+
+    // Rebase texcoords to patch-local coordinates (with border)
+    math::Vec2f min_vec(static_cast<float>(min_x), static_cast<float>(min_y));
     for (std::size_t i = 0; i < texcoords.size(); ++i) {
-        texcoords[i] -= origin;
+        texcoords[i] -= min_vec;
     }
 
-    // --- Build the patch image from the source view ---
     mve::FloatImage::Ptr image;
 
     if (view_image->get_type() == mve::IMAGE_TYPE_FLOAT) {
         mve::FloatImage::Ptr float_image = texture_view.get_image<float>();
-        const float fill_color[3] = {
-            std::numeric_limits<float>::max(),
-            0.0f,
-            std::numeric_limits<float>::max()
-        };
-        image = mve::image::crop(
-            float_image, width, height, min_x, min_y, fill_color);
+
+        math::Vec3f fill_color(3.402823466e38f, 0.0f, 3.402823466e38f);
+        image = mve::image::crop<float>(
+            float_image, width, height, min_x, min_y,
+            fill_color.begin()  // const float*
+        );
     }
     else if (view_image->get_type() == mve::IMAGE_TYPE_UINT16) {
         mve::RawImage::Ptr raw_image = texture_view.get_image<uint16_t>();
-        const uint16_t fill_color[3] = {
-            std::numeric_limits<uint16_t>::max(),
-            static_cast<uint16_t>(0),
-            std::numeric_limits<uint16_t>::max()
-        };
-        mve::RawImage::Ptr cropped = mve::image::crop(
-            raw_image, width, height, min_x, min_y, fill_color);
-        image = mve::image::raw_to_float_image(cropped);
+
+        math::Vec3us fill_color(65535, 0, 65535);
+        raw_image = mve::image::crop<uint16_t>(
+            raw_image, width, height, min_x, min_y,
+            fill_color.begin()  // const uint16_t*
+        );
+        image = mve::image::raw_to_float_image(raw_image);
     }
     else {
         mve::ByteImage::Ptr byte_image = texture_view.get_image<uint8_t>();
-        const uint8_t fill_color[3] = {
-            std::numeric_limits<uint8_t>::max(),
-            static_cast<uint8_t>(0),
-            std::numeric_limits<uint8_t>::max()
-        };
-        mve::ByteImage::Ptr cropped = mve::image::crop(
-            byte_image, width, height, min_x, min_y, fill_color);
-        image = mve::image::byte_to_float_image(cropped);
+
+        math::Vec3uc fill_color(255, 0, 255);
+        byte_image = mve::image::crop<uint8_t>(
+            byte_image, width, height, min_x, min_y,
+            fill_color.begin()  // const uint8_t*
+        );
+        image = mve::image::byte_to_float_image(byte_image);
     }
 
     if (settings.tone_mapping == TONE_MAPPING_GAMMA) {
         mve::image::gamma_correct(image, 2.2f);
     }
 
-    // IMPORTANT: make the ROI purely local and consistent with image size.
-    Rect<int> roi(0, 0, width - 1, height - 1);
-
     TexturePatchCandidate texture_patch_candidate =
-        { roi, TexturePatch::create(label, faces, texcoords, image) };
+        { Rect<int>(min_x, min_y, max_x, max_y),
+          TexturePatch::create(label, faces, texcoords, image) };
 
     return texture_patch_candidate;
 }
