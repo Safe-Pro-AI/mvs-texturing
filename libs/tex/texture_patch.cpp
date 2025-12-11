@@ -180,48 +180,58 @@ TexturePatch::set_pixel_value(math::Vec2i pixel, math::Vec3f color) {
 void
 TexturePatch::blend(mve::FloatImage::ConstPtr orig)
 {
-    // Basic sanity: all required images must exist.
-    if (!orig || !blending_mask || !image || !validity_mask)
+    // We need these three at minimum.
+    if (!image || !blending_mask || !validity_mask)
         return;
 
-    int w  = image->width();
-    int h  = image->height();
-    int ch = image->channels();
+    const int iw  = image->width();
+    const int ih  = image->height();
+    const int ich = image->channels();
 
-    // Sanity checks for dimensions.
-    if (w <= 0 || h <= 0 ||
-        blending_mask->width()  != w ||
-        blending_mask->height() != h ||
-        validity_mask->width()  != w ||
-        validity_mask->height() != h) {
-        // Something is inconsistent; safest is to bail.
+    if (iw <= 0 || ih <= 0 || ich <= 0)
         return;
+
+    const int mw = blending_mask->width();
+    const int mh = blending_mask->height();
+    const int vw = validity_mask->width();
+    const int vh = validity_mask->height();
+
+    if (mw <= 0 || mh <= 0 || vw <= 0 || vh <= 0)
+        return;
+
+    // Determine the overlapping region for blending.
+    int tw = iw;
+    int th = ih;
+
+    tw = std::min(tw, mw);
+    th = std::min(th, mh);
+
+    if (orig) {
+        tw = std::min(tw, orig->width());
+        th = std::min(th, orig->height());
     }
 
-    // orig is supposed to correspond to this patch image. If it does not,
-    // we will *not* run Poisson blending, and instead do a simple alpha blend.
-    bool orig_matches =
-        (orig->width()  == w) &&
-        (orig->height() == h) &&
-        (orig->channels() == ch);
+    if (tw <= 0 || th <= 0)
+        return;
 
-    if (orig_matches) {
-        // Normal path: sizes look sane -> run Poisson blending.
-        poisson_blend(orig, blending_mask, image, 1.0f);
-    } else {
-        // Fallback path: simple masked blend to avoid heap corruption.
-        int tw = std::min(w, orig->width());
-        int th = std::min(h, orig->height());
-        int tch = std::min(ch, orig->channels());
+    // If we have an "orig" patch of the same type, we blend it in.
+    const bool have_orig =
+        orig &&
+        orig->width()  >= tw &&
+        orig->height() >= th &&
+        orig->channels() == ich;
 
+    if (have_orig) {
+        // Simple per-pixel alpha blend using blending_mask as [0,255] alpha.
         for (int y = 0; y < th; ++y) {
             for (int x = 0; x < tw; ++x) {
-                unsigned char mask_val = blending_mask->at(x, y, 0);
-                if (mask_val == 0)
-                    continue;
+                unsigned char m = blending_mask->at(x, y, 0);
+                if (m == 0)
+                    continue;  // no change
 
-                float a = static_cast<float>(mask_val) / 255.0f;
-                for (int c = 0; c < tch; ++c) {
+                float a = static_cast<float>(m) / 255.0f;
+
+                for (int c = 0; c < ich; ++c) {
                     float src = orig->at(x, y, c);
                     float dst = image->at(x, y, c);
                     image->at(x, y, c) = a * src + (1.0f - a) * dst;
@@ -229,10 +239,15 @@ TexturePatch::blend(mve::FloatImage::ConstPtr orig)
             }
         }
     }
+    // else: no orig or incompatible — just keep "image" as is.
 
-    // Invalidate all pixels outside the boundary (unchanged logic).
-    for (int y = 0; y < blending_mask->height(); ++y) {
-        for (int x = 0; x < blending_mask->width(); ++x) {
+    // Invalidate all pixels outside the boundary (mask value 64),
+    // clamped to the overlap of blending_mask and validity_mask.
+    const int iw_mask = std::min(mw, vw);
+    const int ih_mask = std::min(mh, vh);
+
+    for (int y = 0; y < ih_mask; ++y) {
+        for (int x = 0; x < iw_mask; ++x) {
             if (blending_mask->at(x, y, 0) == 64) {
                 validity_mask->at(x, y, 0) = 0;
             }
