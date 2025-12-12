@@ -180,80 +180,61 @@ TexturePatch::set_pixel_value(math::Vec2i pixel, math::Vec3f color) {
 void
 TexturePatch::blend(mve::FloatImage::ConstPtr orig)
 {
-    // We need these three at minimum.
-    if (!image || !blending_mask || !validity_mask)
+
+    if (!orig || !image || !blending_mask || !validity_mask)
         return;
 
-    const int iw  = image->width();
-    const int ih  = image->height();
-    const int ich = image->channels();
+    const int w  = image->width();
+    const int h  = image->height();
+    const int cw = orig->width();
+    const int ch = orig->height();
 
-    if (iw <= 0 || ih <= 0 || ich <= 0)
+  
+    if (w != cw || h != ch)
         return;
 
-    const int mw = blending_mask->width();
-    const int mh = blending_mask->height();
-    const int vw = validity_mask->width();
-    const int vh = validity_mask->height();
-
-    if (mw <= 0 || mh <= 0 || vw <= 0 || vh <= 0)
+ 
+    if (blending_mask->width() != w || blending_mask->height() != h)
         return;
 
-    // Determine the overlapping region for blending.
-    int tw = iw;
-    int th = ih;
+    const int img_channels = image->channels();
+    const int orig_channels = orig->channels();
 
-    tw = std::min(tw, mw);
-    th = std::min(th, mh);
-
-    if (orig) {
-        tw = std::min(tw, orig->width());
-        th = std::min(th, orig->height());
-    }
-
-    if (tw <= 0 || th <= 0)
+    
+    if (img_channels != orig_channels || img_channels < 3)
         return;
 
-    // If we have an "orig" patch of the same type, we blend it in.
-    const bool have_orig =
-        orig &&
-        orig->width()  >= tw &&
-        orig->height() >= th &&
-        orig->channels() == ich;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
 
-    if (have_orig) {
-        // Simple per-pixel alpha blend using blending_mask as [0,255] alpha.
-        for (int y = 0; y < th; ++y) {
-            for (int x = 0; x < tw; ++x) {
-                unsigned char m = blending_mask->at(x, y, 0);
-                if (m == 0)
-                    continue;  // no change
+            unsigned char m = blending_mask->at(x, y, 0);
 
-                float a = static_cast<float>(m) / 255.0f;
-
-                for (int c = 0; c < ich; ++c) {
-                    float src = orig->at(x, y, c);
-                    float dst = image->at(x, y, c);
-                    image->at(x, y, c) = a * src + (1.0f - a) * dst;
-                }
-            }
-        }
-    }
-    // else: no orig or incompatible — just keep "image" as is.
-
-    // Invalidate all pixels outside the boundary (mask value 64),
-    // clamped to the overlap of blending_mask and validity_mask.
-    const int iw_mask = std::min(mw, vw);
-    const int ih_mask = std::min(mh, vh);
-
-    for (int y = 0; y < ih_mask; ++y) {
-        for (int x = 0; x < iw_mask; ++x) {
-            if (blending_mask->at(x, y, 0) == 64) {
+        
+            if (m == 64) {
                 validity_mask->at(x, y, 0) = 0;
+                continue;
+            }
+
+        
+            if (m == 0)
+                continue;
+
+          
+            float alpha = static_cast<float>(m) / 255.0f;
+            if (alpha < 0.0f) alpha = 0.0f;
+            if (alpha > 1.0f) alpha = 1.0f;
+
+        
+            for (int c = 0; c < 3; ++c) {
+                float dst = image->at(x, y, c);
+                float src = orig->at(x, y, c);
+                image->at(x, y, c) = alpha * dst + (1.0f - alpha) * src;
             }
         }
     }
+
 }
+
 
 
 typedef std::vector<std::pair<int, int> > PixelVector;
